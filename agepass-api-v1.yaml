@@ -1,0 +1,1005 @@
+openapi: 3.1.0
+info:
+  title: "AgePass — Infrastructure de conformité du retrait autonome"
+  version: "1.10.0"
+  description: >
+    AgePass est l'infrastructure de conformité pour le retrait autonome de
+    produits soumis à conditions réglementaires (casiers connectés,
+    click-and-collect, drives robotisés). Cette API n'est pas une simple
+    fonction de vérification d'âge ponctuelle : elle sécurise juridiquement
+    l'ensemble du parcours, de la vérification de la personne jusqu'à la
+    preuve de remise effective du produit.
+    AgePass ne stocke jamais de données d'identité ou de date de naissance :
+    seul un résultat binaire (vérifié / non vérifié) est retourné, conformément
+    aux obligations légales applicables à la vente et à la remise de produits
+    soumis à une condition d'âge.
+    Authentification standard OAuth2 (client_credentials) avec jetons JWT signés,
+    indépendante de toute technologie front ou back-end côté partenaire.
+
+
+    ## Comment ça marche
+
+
+    | Étape métier | Où dans l'API |
+
+    |---|---|
+
+    | 1. Produit +18 détecté | Le partenaire connaît son catalogue : il transmet `required_age` et `product_categories` à la création de session. Hors périmètre AgePass. |
+
+    | 2. Identité | Redirection vers `verification_url` (page hébergée AgePass) : capture du document d'identité, consentement explicite avant toute capture biométrique. |
+
+    | 3. Biométrie | Sur la même page : vérification biométrique éphémère (liveness + correspondance visage/document), via des partenaires spécialisés de vérification biométrique sélectionnés selon des exigences de disponibilité et de conformité. |
+
+    | 4. Jeton horodaté | Une fois validée, AgePass émet un `unlock_token` signé et horodaté, transmis via le webhook `session.completed` et lisible sur `GET /sessions/{id}`. |
+
+    | 5. Ouverture casier | Le casier vérifie localement la signature du `unlock_token` (clé publique exposée sur `/.well-known/jwks.json`) et déclenche l'ouverture physique. |
+
+    | 6. Confirmation physique | Le casier confirme via `POST /sessions/{id}/confirm-unlock` que le produit a été remis (ou non) — ferme la chaîne de preuve. |
+
+
+    > **Répartition des responsabilités — détection produit.** Le tag "produit
+    > soumis à condition d'âge" est porté par le système d'information du
+    > distributeur (PIM/ERP). AgePass ne référence pas de catalogue produit :
+    > `required_age` et `product_categories` sont réputés déjà qualifiés par
+    > le distributeur. AgePass prend le relais à partir de la vérification de
+    > la personne (étapes 2 à 6).
+
+
+    ## Disponibilité, hébergement & SLA
+
+
+    - **Objectif de disponibilité : 99,9 %.**
+
+    - **Hébergement & souveraineté.** Les traitements et journaux applicatifs
+      sont hébergés au sein de l'Union Européenne.
+
+    - **Maintenance planifiée** communiquée au moins 72h à l'avance.
+
+    - **Status page** disponible sur demande auprès de votre interlocuteur AgePass.
+
+
+    ## Versionnage & gestion des breaking changes
+
+
+    - Le chemin `/v1` est la version majeure du contrat. Tout changement non
+      rétrocompatible sera livré sous une nouvelle version majeure (`/v2`),
+      jamais en place sur `/v1`.
+
+    - Les évolutions rétrocompatibles (nouveaux champs optionnels, nouveaux
+      endpoints) sont livrées au sein de `/v1` et tracées au changelog ci-dessous.
+
+    - En complément, l'en-tête `Accept: application/vnd.agepass.v1+json` peut
+      être envoyé pour figer explicitement le contrat consommé ; la réponse
+      porte le même `Content-Type`.
+
+    - Tout champ ou endpoint déprécié est annoncé avec un préavis minimum de
+      6 mois, signalé via les en-têtes HTTP `Deprecation` et `Sunset`
+      (RFC 8594) avant suppression effective.
+
+
+    ## Limites de débit
+
+
+    Chaque réponse porte les en-têtes `X-RateLimit-Limit`,
+    `X-RateLimit-Remaining` et `X-RateLimit-Reset` (300 requêtes/minute par
+    client). Au-delà du quota : `429 Too Many Requests` avec en-tête `Retry-After`.
+
+
+    ## Traçabilité des requêtes
+
+
+    Le client peut envoyer un en-tête `X-Correlation-Id` (UUID) sur n'importe
+    quelle requête ; il est repris à l'identique dans la réponse. S'il est
+    absent, AgePass en génère un. Très utile pour faire correspondre vos logs
+    et les nôtres en cas de support ou de débogage.
+
+
+    ## Sandbox
+
+
+    Un environnement sandbox est disponible avec des données fictives,
+    testable immédiatement sans intégration de production préalable — voir
+    `servers` ci-dessous (sandbox listé en premier). Mêmes contrats, mêmes
+    codes d'erreur, mêmes webhooks que la production.
+
+
+    ## Sécurité
+
+
+    - **Identité du partenaire.** `retailer_id` n'est jamais lu depuis le body
+      de la requête : il est dérivé du claim `sub` du jeton JWT authentifiant
+      l'appel.
+
+    - **Cloisonnement des ressources (anti-IDOR).** Toutes les opérations sur
+      `/sessions/{id}` vérifient que la session appartient au retailer
+      authentifié. Sinon : `404` (jamais `403`).
+
+    - **Propriété du casier.** `locker_id` doit être enregistré pour le
+      retailer authentifié — `403 RETAILER_FORBIDDEN` s'il appartient à un
+      autre retailer, `404 LOCKER_NOT_FOUND` s'il est totalement inconnu.
+
+    - **Idempotence.** `POST /sessions` requiert un en-tête `Idempotency-Key`.
+
+    - **Anti-replay.** Le `unlock_token` porte un identifiant unique (`jti`),
+      à invalider après la première ouverture. Sa durée de validité est
+      portée explicitement par `unlock_token_expires_at`.
+
+    - **Rotation des clés.** Les clés de signature (`unlock_token`,
+      `proof_signature`) peuvent être renouvelées sans interruption de
+      service : plusieurs clés peuvent coexister simultanément dans le JWKS
+      durant les périodes de transition, chacune identifiée par son `kid`.
+
+    - **Authenticité du webhook.** En-tête `AgePass-Signature` (HMAC-SHA256).
+      Seul le `unlock_token` (signature vérifiée via JWKS) doit déclencher
+      une action physique.
+
+    - **`callback_url`.** Doit correspondre à un domaine pré-enregistré à
+      l'onboarding (`400 CALLBACK_URL_NOT_ALLOWED` sinon).
+
+    - **Usage unique de `verification_url`.** Invalidée après complétion ou expiration.
+
+    - **Intégrité du certificat.** `ComplianceProof` porte une signature
+      numérique (`proof_signature`), vérifiable via la même clé JWKS.
+
+
+    ## Conformité réglementaire (RGPD / protection des mineurs)
+
+
+    - **Hébergement.** Voir la section *Disponibilité, hébergement & SLA* ci-dessus.
+
+    - **Traitement biométrique éphémère (art. 9 RGPD).** Consentement
+      explicite avant toute capture. Aucune donnée biométrique brute
+      conservée au-delà de la session active.
+
+    - **AIPD** tenue à disposition de l'autorité de contrôle.
+
+    - **Partenaires de vérification biométrique.** AgePass s'appuie sur des
+      partenaires spécialisés de vérification biométrique, sélectionnés selon
+      des exigences de disponibilité et de conformité. Les traitements sont
+      encadrés conformément aux exigences applicables du RGPD.
+
+    - **Droit à la révision humaine (art. 22 RGPD).** Voir
+      `POST /sessions/{id}/appeal`.
+
+    - **Chaîne de preuve fermée.** Voir `POST /sessions/{id}/confirm-unlock`.
+
+    - **Horodatage.** Tous les horodatages exposés par l'API (création,
+      vérification, expiration, preuve) sont exprimés en UTC, format ISO-8601.
+
+    - **Gestion des incidents.** En cas d'incident de sécurité affectant des
+      données personnelles, AgePass applique une procédure de gestion des
+      incidents conforme aux exigences du RGPD.
+
+
+    ## Codes d'erreur
+
+
+    Distinction importante : les codes ci-dessous qualifient un problème de
+    **requête HTTP**. Le motif d'un **rejet de vérification** (la requête a
+    réussi, la personne n'a pas été validée) est porté séparément par
+    `Session.rejection_reason` — ce n'est pas une erreur HTTP.
+
+
+    **Erreurs de requête (`error.code`)**
+
+
+    | Code | HTTP | Description |
+
+    |---|---|---|
+
+    | INVALID_REQUEST | 400 | Requête malformée ou champ invalide |
+
+    | CALLBACK_URL_NOT_ALLOWED | 400 | Domaine non pré-enregistré pour ce retailer |
+
+    | UNAUTHORIZED | 401 | Jeton manquant, expiré ou invalide |
+
+    | RETAILER_FORBIDDEN | 403 | locker_id enregistré pour un autre retailer |
+
+    | LOCKER_NOT_FOUND | 404 | Aucun casier enregistré avec cet identifiant |
+
+    | SESSION_NOT_FOUND | 404 | Session inexistante ou hors périmètre du retailer |
+
+    | IDEMPOTENCY_KEY_CONFLICT | 409 | Idempotency-Key déjà utilisée avec un payload différent |
+
+    | RATE_LIMIT_EXCEEDED | 429 | Quota de requêtes dépassé |
+
+
+    **Motifs de rejet (`Session.rejection_reason`, hors HTTP)**
+
+
+    | Code | Description |
+
+    |---|---|
+
+    | AGE_NOT_VERIFIED | Âge requis non confirmé par les éléments présentés |
+
+    | DOCUMENT_INVALID | Document d'identité illisible, expiré ou non reconnu |
+
+    | LIVENESS_FAILED | Échec du contrôle de vivacité biométrique |
+
+
+    ## Exploitation
+
+
+    - **Supervision.** `GET /health` (non authentifié).
+
+    - **Audit.** `GET /sessions` — pagination par curseur (stable), tri par
+      défaut sur created_at (décroissant), filtres temporels sur la création
+      (`from`/`to`) et sur la remise physique confirmée
+      (`unlock_confirmed_from`/`unlock_confirmed_to`) — ex: retrouver toutes
+      les remises effectuées entre deux dates.
+
+    - **Conservation des preuves.** La durée de conservation est configurable
+      contractuellement et explicitée dans le contrat de service.
+
+    - **Résilience du webhook.** Backoff exponentiel sur 24h (8 tentatives) en cas de non-2xx ; `GET /sessions/{id}` en filet de sécurité.
+
+
+    ## Changelog
+
+
+    | Version | Contenu |
+
+    |---|---|
+
+    | 1.0.0 | Sessions, preuve de conformité |
+
+    | 1.1.0 | Authentification OAuth2 / JWT |
+
+    | 1.2.0 | Idempotence, anti-IDOR, signature webhook, propriété du casier |
+
+    | 1.3.0 | GET /health, GET /sessions (audit), rate limiting |
+
+    | 1.4.0 | POST /confirm-unlock, POST /appeal, conformité biométrique RGPD |
+
+    | 1.5.0 | Versionnage, codes d'erreur métier, unlock_token_expires_at, sandbox en premier, événements webhook réservés |
+
+    | 1.6.0 | SLA/disponibilité, hébergement UE, rotation des clés JWKS, proof_id/issued_at, politique de rétention précisée, repositionnement "infrastructure de conformité" |
+
+    | 1.7.0 | Status page reformulée, hébergement mis en avant, fournisseurs biométriques génériques (non nommés), timestamp ajouté à GET /health |
+
+    | 1.8.0 | Retrait des mentions de validation juridique interne, SLA reformulé en objectif plutôt qu'engagement chiffré |
+
+    | 1.9.0 | /health minimal (anti-fingerprinting), GET /sessions : tri explicite + filtres sur la remise physique confirmée |
+
+    | 1.10.0 | X-Correlation-Id, procédure de gestion des incidents RGPD, contact technique (support@agepass.fr) |
+  contact:
+    name: AgePass Support
+    email: contact@agepass.fr
+    url: https://agepass.fr
+
+servers:
+  - url: https://sandbox.agepass.fr/v1
+    description: Sandbox (données fictives, accès immédiat)
+  - url: https://api.agepass.fr/v1
+    description: Production
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Monitoring
+    description: Supervision du service
+  - name: Auth
+    description: Émission et vérification des jetons
+  - name: Sessions
+    description: Création, suivi, audit et confirmation physique des sessions
+  - name: Proof
+    description: Récupération de la preuve de conformité
+
+paths:
+  /health:
+    get:
+      tags: [Monitoring]
+      summary: Vérifier la disponibilité du service
+      description: >
+        Réponse volontairement minimale (aucune information de version ou de
+        dépendance technique exposée sur cet endpoint non authentifié).
+      security: []
+      responses:
+        '200':
+          description: Service opérationnel
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  timestamp:
+                    type: string
+                    format: date-time
+                    example: "2026-06-23T10:15:00Z"
+                    description: Heure serveur au moment de la réponse, UTC ISO-8601.
+              example:
+                status: "ok"
+                timestamp: "2026-06-23T10:15:00Z"
+
+  /auth/token:
+    post:
+      tags: [Auth]
+      summary: Obtenir un jeton d'accès JWT
+      description: >
+        Flow OAuth2 standard (grant_type=client_credentials). Le jeton retourné
+        est un JWT signé, valide 1h. Le claim `sub` correspond au
+        `retailer_id` du partenaire authentifié.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+            example:
+              client_id: "carrefour-proximite"
+              client_secret: "••••••••••••"
+              grant_type: "client_credentials"
+      responses:
+        '200':
+          description: Jeton émis
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /.well-known/jwks.json:
+    get:
+      tags: [Auth]
+      summary: Clé publique de vérification (JWKS)
+      description: >
+        Vérification locale et hors-ligne du unlock_token et du
+        proof_signature. Format JWKS standard (RFC 7517). Les clés de
+        signature peuvent être renouvelées sans interruption de service :
+        plusieurs clés peuvent être publiées simultanément dans ce document
+        durant les périodes de transition, chacune identifiée par son `kid`.
+      security: []
+      responses:
+        '200':
+          description: Jeu de clés publiques
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+
+  /sessions:
+    post:
+      tags: [Sessions]
+      summary: Créer une session de vérification d'âge
+      description: >
+        Le retailer_id est dérivé du jeton JWT (claim sub), jamais du body.
+        Le locker_id doit être enregistré pour ce retailer.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionRequest'
+            example:
+              locker_id: "LCK-STETIENNE-014"
+              order_id: "CMD-2026-88231"
+              required_age: 18
+              product_categories: ["alcohol"]
+              callback_url: "https://partner.example.com/webhooks/agepass"
+      responses:
+        '201':
+          description: Session créée
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/RetailerForbidden'
+        '404':
+          $ref: '#/components/responses/LockerNotFound'
+        '409':
+          description: Idempotency-Key déjà utilisée avec un payload différent (code IDEMPOTENCY_KEY_CONFLICT)
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+    get:
+      tags: [Sessions]
+      summary: Lister les sessions du retailer authentifié
+      description: >
+        Résultats automatiquement limités au retailer_id dérivé du jeton.
+        Tri par défaut : created_at décroissant (plus récent en premier),
+        inversable via le paramètre sort. La pagination par curseur reste
+        stable même si de nouvelles sessions sont créées pendant
+        l'itération (contrairement à une pagination par offset). Pour
+        retrouver des remises physiques sur une période donnée (ex: "toutes
+        les remises entre le 1er et le 15 juin"), utiliser
+        unlock_confirmed_from/unlock_confirmed_to plutôt que from/to, qui
+        filtrent sur la création de la session et non sur la remise.
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, in_progress, verified, rejected, under_appeal, expired, cancelled]
+        - name: locker_id
+          in: query
+          schema:
+            type: string
+        - name: from
+          in: query
+          description: Filtre sur created_at >= from
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: Filtre sur created_at <= to
+          schema:
+            type: string
+            format: date-time
+        - name: unlock_confirmed_from
+          in: query
+          description: Filtre sur unlock_confirmed_at >= valeur — utile pour les rapports de remise physique
+          schema:
+            type: string
+            format: date-time
+        - name: unlock_confirmed_to
+          in: query
+          description: Filtre sur unlock_confirmed_at <= valeur
+          schema:
+            type: string
+            format: date-time
+        - name: sort
+          in: query
+          description: Ordre de tri sur created_at
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 25
+            maximum: 100
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Liste paginée des sessions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /sessions/{session_id}:
+    get:
+      tags: [Sessions]
+      summary: Récupérer le statut d'une session
+      description: Retourne 404 SESSION_NOT_FOUND si la session n'existe pas OU n'appartient pas au retailer authentifié.
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Statut courant de la session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /sessions/{session_id}/cancel:
+    post:
+      tags: [Sessions]
+      summary: Annuler une session en cours
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Session annulée
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Session déjà finalisée
+
+  /sessions/{session_id}/confirm-unlock:
+    post:
+      tags: [Sessions]
+      summary: Confirmer le résultat physique de l'ouverture
+      description: >
+        Appelé par le contrôleur du casier après vérification locale de la
+        signature du unlock_token. Referme la chaîne de preuve.
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnlockConfirmation'
+            example:
+              outcome: "opened"
+              confirmed_at: "2026-06-23T10:17:55Z"
+      responses:
+        '200':
+          description: Confirmation enregistrée
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: unlock_token déjà consommé ou confirmation déjà reçue
+
+  /sessions/{session_id}/appeal:
+    post:
+      tags: [Sessions]
+      summary: Demander une révision humaine d'un rejet automatique
+      description: >
+        Art. 22 RGPD. Disponible uniquement si status="rejected". Fait passer
+        la session en status="under_appeal" ; la résolution est notifiée via
+        le webhook session.completed.
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '202':
+          description: Demande de révision enregistrée
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Session pas au statut "rejected", ou révision déjà demandée
+
+  /sessions/{session_id}/proof:
+    get:
+      tags: [Proof]
+      summary: Récupérer la preuve de conformité
+      description: >
+        Disponible si status="verified" ou "rejected". Atteste la
+        vérification de la personne et, si disponible, la remise effective du
+        produit. Aucune donnée d'identité.
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Certificat de conformité
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ComplianceProof'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Session pas encore finalisée
+
+webhooks:
+  sessionCompleted:
+    post:
+      summary: Notification de fin de vérification (actif)
+      description: >
+        Seul événement actuellement émis. Envoyé lorsque le statut passe à
+        "verified", "rejected" ou "expired" (y compris après une révision
+        d'appel). Seul le unlock_token (signature vérifiée via JWKS) doit
+        déclencher une action physique. Retry avec backoff exponentiel
+        pendant 24h (8 tentatives) en cas de non-2xx.
+      parameters:
+        - name: AgePass-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+          description: HMAC-SHA256 du corps brut, secret partagé à l'onboarding.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '200':
+          description: Accusé de réception par le partenaire
+
+  sessionCreated:
+    post:
+      summary: Notification de création de session (réservé — non émis en v1.7)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '200':
+          description: Accusé de réception
+
+  sessionExpired:
+    post:
+      summary: Notification d'expiration dédiée (réservé — non émis en v1.7)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '200':
+          description: Accusé de réception
+
+  sessionCancelled:
+    post:
+      summary: Notification d'annulation dédiée (réservé — non émis en v1.7)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '200':
+          description: Accusé de réception
+
+  sessionAppealCreated:
+    post:
+      summary: Notification de demande de révision (réservé — non émis en v1.7)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '200':
+          description: Accusé de réception
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Jeton JWT obtenu via POST /auth/token. Le claim sub identifie le
+        partenaire et fait foi pour toute opération.
+
+  parameters:
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+      description: UUID v4 généré côté client. Un retry avec la même clé renvoie la session déjà créée.
+
+  schemas:
+    TokenRequest:
+      type: object
+      required: [client_id, client_secret, grant_type]
+      properties:
+        client_id:
+          type: string
+        client_secret:
+          type: string
+          format: password
+        grant_type:
+          type: string
+          enum: [client_credentials]
+
+    TokenResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+          description: JWT signé. Le claim sub contient le retailer_id.
+        token_type:
+          type: string
+          example: "Bearer"
+        expires_in:
+          type: integer
+          example: 3600
+
+    CreateSessionRequest:
+      type: object
+      description: retailer_id n'est volontairement pas un champ de ce body, dérivé du claim sub du jeton JWT.
+      required: [locker_id, required_age, product_categories]
+      properties:
+        locker_id:
+          type: string
+          description: Doit être enregistré pour le retailer authentifié.
+        order_id:
+          type: string
+        required_age:
+          type: integer
+          example: 18
+          minimum: 0
+          maximum: 99
+        product_categories:
+          type: array
+          items:
+            type: string
+            enum: [alcohol, vape, cbd]
+        callback_url:
+          type: string
+          format: uri
+          description: Doit correspondre à un domaine pré-enregistré à l'onboarding.
+
+    UnlockConfirmation:
+      type: object
+      required: [outcome]
+      properties:
+        outcome:
+          type: string
+          enum: [opened, failed, timeout]
+        confirmed_at:
+          type: string
+          format: date-time
+          description: UTC, ISO-8601.
+
+    Session:
+      type: object
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, in_progress, verified, rejected, under_appeal, expired, cancelled]
+        locker_id:
+          type: string
+        retailer_id:
+          type: string
+          description: Dérivé du claim sub du jeton JWT, jamais du body client.
+        required_age:
+          type: integer
+        age_verified:
+          type: boolean
+          nullable: true
+        rejection_reason:
+          type: string
+          nullable: true
+          enum: [AGE_NOT_VERIFIED, DOCUMENT_INVALID, LIVENESS_FAILED]
+        verification_url:
+          type: string
+          format: uri
+          description: Usage unique, invalidée après complétion ou expiration.
+        unlock_token:
+          type: string
+          nullable: true
+          description: JWT signé, présent uniquement si status="verified". Claim jti à invalider après la première ouverture.
+        unlock_token_expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: UTC, ISO-8601. Horodatage explicite d'expiration du unlock_token (~2 minutes après émission).
+        unlock_outcome:
+          type: string
+          nullable: true
+          enum: [opened, failed, timeout]
+        unlock_confirmed_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        verified_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    SessionList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Session'
+        next_cursor:
+          type: string
+          nullable: true
+
+    ComplianceProof:
+      type: object
+      properties:
+        proof_id:
+          type: string
+          format: uuid
+          description: Identifiant unique de ce certificat, distinct du session_id.
+        session_id:
+          type: string
+          format: uuid
+        compliance_reference:
+          type: string
+          example: "AGP-2026-088231"
+        age_verified:
+          type: boolean
+        required_age:
+          type: integer
+        rejection_reason:
+          type: string
+          nullable: true
+          enum: [AGE_NOT_VERIFIED, DOCUMENT_INVALID, LIVENESS_FAILED]
+        verification_method:
+          type: string
+          enum: [identity_document_biometric_match, facial_age_estimation_liveness]
+          example: "identity_document_biometric_match"
+        verified_at:
+          type: string
+          format: date-time
+        issued_at:
+          type: string
+          format: date-time
+          description: >
+            UTC, ISO-8601. Horodatage d'émission du certificat lui-même (peut
+            différer de verified_at si la génération est asynchrone).
+        qualified_timestamp:
+          type: string
+          description: Horodatage électronique conforme eIDAS (art. 41), apposé par une autorité d'horodatage tierce.
+        unlock_outcome:
+          type: string
+          nullable: true
+          enum: [opened, failed, timeout]
+        unlock_confirmed_at:
+          type: string
+          format: date-time
+          nullable: true
+        legal_basis:
+          type: string
+          description: >
+            Référence à la base légale applicable selon la catégorie de
+            produit concernée — à confirmer avec votre service juridique, la
+            réglementation pouvant varier par catégorie et évoluer dans le temps.
+          example: "Obligations légales applicables à la vente et à la remise de produits soumis à une condition d'âge"
+        certificate_url:
+          type: string
+          format: uri
+          description: PDF horodaté téléchargeable.
+        proof_signature:
+          type: string
+          description: Signature JWS du contenu du certificat, vérifiable via JWKS (clé identifiée par kid).
+
+    WebhookPayload:
+      type: object
+      properties:
+        event:
+          type: string
+          example: "session.completed"
+        session_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, verified, rejected, under_appeal, expired, cancelled]
+        age_verified:
+          type: boolean
+        rejection_reason:
+          type: string
+          nullable: true
+          enum: [AGE_NOT_VERIFIED, DOCUMENT_INVALID, LIVENESS_FAILED]
+        locker_id:
+          type: string
+        unlock_token:
+          type: string
+          nullable: true
+        unlock_token_expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        verified_at:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              enum:
+                - INVALID_REQUEST
+                - CALLBACK_URL_NOT_ALLOWED
+                - UNAUTHORIZED
+                - RETAILER_FORBIDDEN
+                - LOCKER_NOT_FOUND
+                - SESSION_NOT_FOUND
+                - IDEMPOTENCY_KEY_CONFLICT
+                - RATE_LIMIT_EXCEEDED
+            message:
+              type: string
+
+  responses:
+    BadRequest:
+      description: Requête invalide (INVALID_REQUEST ou CALLBACK_URL_NOT_ALLOWED)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: "INVALID_REQUEST"
+              message: "required_age must be an integer between 0 and 99."
+    Unauthorized:
+      description: Jeton manquant, expiré ou invalide
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: "UNAUTHORIZED"
+              message: "Missing or invalid bearer token."
+    RetailerForbidden:
+      description: locker_id enregistré pour un autre retailer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: "RETAILER_FORBIDDEN"
+              message: "This locker_id belongs to another retailer."
+    LockerNotFound:
+      description: Aucun casier enregistré avec cet identifiant
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: "LOCKER_NOT_FOUND"
+              message: "No locker registered with this id."
+    NotFound:
+      description: Session introuvable (inexistante ou hors périmètre du retailer)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: "SESSION_NOT_FOUND"
+              message: "No session found for this id."
+    TooManyRequests:
+      description: Quota de requêtes dépassé
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: "RATE_LIMIT_EXCEEDED"
+              message: "Rate limit exceeded, retry after the delay indicated."
